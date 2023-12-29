@@ -1,0 +1,33 @@
+---
+- name: modifying /etc/issue content
+  hosts: all
+  become: true 
+  tasks:
+    - name: Replace /etc/issue content with Proxy
+      ansible.builtin.replace:
+        path: /etc/issue
+        regexp: '^(.+)$'
+        replace: 'Proxy'
+      when: "'proxy' in group_names"
+
+    - name: Replace /etc/issue content with Test
+      ansible.builtin.replace:
+        path: /etc/issue
+        regexp: '^(.+)$'
+        replace: 'Test'
+      when: "'test' in group_names"
+
+    - name: Replace /etc/issue content with database
+      ansible.builtin.replace:
+        path: /etc/issue
+        regexp: '^(.+)$'
+        replace: 'database'
+      when: "'database' in group_names"
+
+    - name: Replace /etc/issue content with webservers
+      ansible.builtin.replace:
+        path: /etc/issue
+        regexp: '^(.+)$'
+        replace: 'Webservers'
+      when: "'webservers' in group_names"
+

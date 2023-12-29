@@ -1,0 +1,3 @@
+ansible/mycollection
+ansible/*.log
+ansible/*.tar.gz

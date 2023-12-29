@@ -1,0 +1,28 @@
+---
+- name: modifying /etc/issue content
+  hosts: all
+  become: true
+  tasks:
+    - name: Replace /etc/issue content with Proxy
+      ansible.builtin.copy:
+        content: "P"
+        dest: /etc/issue
+      when: "'proxy' in group_names"
+
+    - name: Replace /etc/issue content with Test
+      ansible.builtin.copy:
+        content: "T"
+        dest: /etc/issue
+      when: "'test' in group_names"
+
+    - name: Replace /etc/issue content with database
+      ansible.builtin.copy:
+        content: "D"
+        dest: /etc/issue
+      when: "'database' in group_names"
+
+    - name: Replace /etc/issue content with database
+      ansible.builtin.copy:
+        content: "W"
+        dest: /etc/issue
+      when: "'webservers' in group_names"
