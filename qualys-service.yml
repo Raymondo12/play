@@ -1,0 +1,159 @@
+---
+- name: Uninstall and Reinstall Qualys Cloud Agent on RHEL
+  hosts: rhel_servers
+  become: yes
+  vars:
+    qualys_temp_path: "/tmp"
+    qualys_service_name: "qualys-cloud-agent"
+    qualys_package_name: "qualys-cloud-agent"
+    qualys_installer_pattern: "QualysCloudAgent*.rpm"
+    backup_config: true
+    config_backup_path: "/tmp/qualys_config_backup_{{ ansible_date_time.epoch }}"
+    
+  tasks:
+    - name: Check if Qualys Cloud Agent is installed
+      command: rpm -q {{ qualys_package_name }}
+      register: qualys_installed
+      failed_when: false
+      changed_when: false
+
+    - name: Display current Qualys agent status
+      debug:
+        msg: "Qualys Cloud Agent status: {{ 'Installed' if qualys_installed.rc == 0 else 'Not installed' }}"
+
+    - name: Stop Qualys Cloud Agent service
+      systemd:
+        name: "{{ qualys_service_name }}"
+        state: stopped
+        enabled: no
+      when: qualys_installed.rc == 0
+      ignore_errors: yes
+
+    - name: Backup Qualys configuration (if exists)
+      block:
+        - name: Create backup directory
+          file:
+            path: "{{ config_backup_path }}"
+            state: directory
+            mode: '0700'
+          when: backup_config
+
+        - name: Backup Qualys configuration files
+          copy:
+            src: "{{ item }}"
+            dest: "{{ config_backup_path }}/"
+            remote_src: yes
+          loop:
+            - "/usr/local/qualys/cloud-agent/etc"
+            - "/etc/qualys"
+          ignore_errors: yes
+          when: backup_config
+      when: qualys_installed.rc == 0
+
+    - name: Uninstall current Qualys Cloud Agent
+      yum:
+        name: "{{ qualys_package_name }}"
+        state: absent
+      when: qualys_installed.rc == 0
+
+    - name: Clean up Qualys directories and files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/usr/local/qualys"
+        - "/etc/qualys"
+        - "/var/log/qualys"
+        - "/var/lib/qualys"
+      ignore_errors: yes
+
+    - name: Find new Qualys installer in /tmp
+      find:
+        paths: "{{ qualys_temp_path }}"
+        patterns: "{{ qualys_installer_pattern }}"
+        file_type: file
+      register: qualys_installer_files
+
+    - name: Fail if no Qualys installer found
+      fail:
+        msg: "No Qualys Cloud Agent installer found in {{ qualys_temp_path }}"
+      when: qualys_installer_files.files | length == 0
+
+    - name: Fail if multiple Qualys installers found
+      fail:
+        msg: "Multiple Qualys installers found. Please ensure only one installer is present in {{ qualys_temp_path }}"
+      when: qualys_installer_files.files | length > 1
+
+    - name: Set installer path
+      set_fact:
+        qualys_installer_path: "{{ qualys_installer_files.files[0].path }}"
+
+    - name: Display installer information
+      debug:
+        msg: "Installing Qualys Cloud Agent from: {{ qualys_installer_path }}"
+
+    - name: Install new Qualys Cloud Agent
+      yum:
+        name: "{{ qualys_installer_path }}"
+        state: present
+        disable_gpg_check: yes
+
+    - name: Verify Qualys Cloud Agent installation
+      command: rpm -q {{ qualys_package_name }}
+      register: qualys_verify
+      changed_when: false
+
+    - name: Display installation verification
+      debug:
+        msg: "Qualys Cloud Agent installed: {{ qualys_verify.stdout }}"
+
+    - name: Start and enable Qualys Cloud Agent service
+      systemd:
+        name: "{{ qualys_service_name }}"
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for service to be active
+      wait_for:
+        timeout: 30
+      delegate_to: localhost
+
+    - name: Check Qualys Cloud Agent service status
+      systemd:
+        name: "{{ qualys_service_name }}"
+      register: qualys_service_status
+
+    - name: Display service status
+      debug:
+        msg: "Qualys Cloud Agent service status: {{ qualys_service_status.status.ActiveState }}"
+
+    - name: Verify agent connectivity (if applicable)
+      command: /usr/local/qualys/cloud-agent/bin/qualys-cloud-agent.sh status
+      register: agent_status
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display agent status
+      debug:
+        msg: "Agent status: {{ agent_status.stdout if agent_status.rc == 0 else 'Status check failed' }}"
+
+    - name: Clean up installer file (optional)
+      file:
+        path: "{{ qualys_installer_path }}"
+        state: absent
+      when: cleanup_installer | default(false)
+
+    - name: Summary
+      debug:
+        msg: |
+          Qualys Cloud Agent reinstallation completed:
+          - Service Status: {{ qualys_service_status.status.ActiveState }}
+          - Configuration backup: {{ config_backup_path if backup_config else 'Not created' }}
+          - Installer cleaned up: {{ 'Yes' if cleanup_installer | default(false) else 'No' }}
+
+  handlers:
+    - name: restart qualys-cloud-agent
+      systemd:
+        name: "{{ qualys_service_name }}"
+        state: restarted
