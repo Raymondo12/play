@@ -1,0 +1,144 @@
+#!/bin/bash
+#===============================================================================
+# rhel_patch.sh
+# Patches RHEL/OEL hosts on the 1st and 3rd Friday of each month.
+# Reboots the host after patching (only if a reboot is actually required,
+# unless FORCE_REBOOT=yes).
+#
+# Deploy to: /usr/local/sbin/rhel_patch.sh  (chmod 750, owned by root)
+# Scheduled via cron -- see the crontab entry at the bottom of this file.
+#===============================================================================
+
+set -o pipefail
+
+LOGFILE="/var/log/rhel_patch.log"
+LOCKFILE="/var/run/rhel_patch.lock"
+FORCE_REBOOT="${FORCE_REBOOT:-no}"   # set to "yes" to always reboot after patching
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] $*" | tee -a "$LOGFILE"
+}
+
+#-------------------------------------------------------------------------------
+# Guard: only run on the 1st or 3rd Friday of the month.
+# Cron fires every Friday (see crontab entry); this check filters the weeks.
+# 1st Friday  = day of month 1-7
+# 3rd Friday  = day of month 15-21
+#-------------------------------------------------------------------------------
+DOM=$(date +%-d)   # day of month without leading zero
+DOW=$(date +%u)    # 5 = Friday
+
+if [[ "$DOW" -ne 5 ]]; then
+    log "Not a Friday (dow=$DOW). Exiting."
+    exit 0
+fi
+
+if ! { [[ "$DOM" -ge 1 && "$DOM" -le 7 ]] || [[ "$DOM" -ge 15 && "$DOM" -le 21 ]]; }; then
+    log "Friday, but not the 1st or 3rd Friday (dom=$DOM). Exiting."
+    exit 0
+fi
+
+#-------------------------------------------------------------------------------
+# Lock to prevent overlapping runs
+#-------------------------------------------------------------------------------
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    log "Another patch run is already in progress. Exiting."
+    exit 1
+fi
+
+log "===== Patch run starting on $(hostname -f) ====="
+log "OS: $(cat /etc/redhat-release 2>/dev/null || echo unknown)"
+log "Kernel before: $(uname -r)"
+
+#-------------------------------------------------------------------------------
+# Pick package manager (dnf on RHEL/OEL 8/9, yum on 7)
+#-------------------------------------------------------------------------------
+if command -v dnf &>/dev/null; then
+    PKG_MGR="dnf"
+else
+    PKG_MGR="yum"
+fi
+log "Using package manager: $PKG_MGR"
+
+#-------------------------------------------------------------------------------
+# Refresh metadata and apply updates
+#-------------------------------------------------------------------------------
+$PKG_MGR clean expire-cache >>"$LOGFILE" 2>&1
+
+log "Checking for available updates..."
+$PKG_MGR check-update >>"$LOGFILE" 2>&1
+CHECK_RC=$?
+
+if [[ $CHECK_RC -eq 0 ]]; then
+    log "No updates available. Nothing to do."
+    log "===== Patch run complete (no changes) ====="
+    exit 0
+elif [[ $CHECK_RC -ne 100 ]]; then
+    log "ERROR: '$PKG_MGR check-update' failed with rc=$CHECK_RC. Check repos/subscription."
+    exit 1
+fi
+
+log "Updates available. Applying..."
+$PKG_MGR -y update >>"$LOGFILE" 2>&1
+UPDATE_RC=$?
+
+if [[ $UPDATE_RC -ne 0 ]]; then
+    log "ERROR: '$PKG_MGR update' failed with rc=$UPDATE_RC. NOT rebooting. Investigate manually."
+    exit 1
+fi
+
+log "Patching completed successfully."
+
+#-------------------------------------------------------------------------------
+# Reboot decision
+#-------------------------------------------------------------------------------
+REBOOT_NEEDED="no"
+
+if [[ "$FORCE_REBOOT" == "yes" ]]; then
+    REBOOT_NEEDED="yes"
+    log "FORCE_REBOOT=yes -- reboot will proceed regardless of needs-restarting."
+elif command -v needs-restarting &>/dev/null; then
+    # needs-restarting -r: rc 1 = reboot required, rc 0 = not required
+    needs-restarting -r >>"$LOGFILE" 2>&1
+    if [[ $? -eq 1 ]]; then
+        REBOOT_NEEDED="yes"
+        log "needs-restarting reports a reboot is required."
+    else
+        log "needs-restarting reports no reboot required."
+    fi
+else
+    # yum-utils not installed; be safe and reboot after patching
+    REBOOT_NEEDED="yes"
+    log "needs-restarting not found (install yum-utils/dnf-utils). Defaulting to reboot."
+fi
+
+if [[ "$REBOOT_NEEDED" == "yes" ]]; then
+    log "Rebooting host in 2 minutes. Run 'shutdown -c' to cancel."
+    log "===== Patch run complete (reboot scheduled) ====="
+    /usr/sbin/shutdown -r +2 "Scheduled post-patching reboot (rhel_patch.sh)" >>"$LOGFILE" 2>&1
+else
+    log "===== Patch run complete (no reboot needed) ====="
+fi
+
+exit 0
+
+#===============================================================================
+# CRON SETUP
+#===============================================================================
+# Cron cannot natively express "1st and 3rd Friday", so the job fires every
+# Friday at 02:00 and the script's date guard decides whether to proceed.
+#
+# Install as root:   crontab -e
+#
+#   # Patch on 1st and 3rd Fridays at 02:00, reboot if needed
+#   0 2 * * 5 /usr/local/sbin/rhel_patch.sh
+#
+# Alternative: do the day-of-month filter directly in cron and skip the
+# in-script guard (note: % must be escaped as \% inside crontab):
+#
+#   0 2 1-7,15-21 * 5 [ "$(date +\%u)" = "5" ] && /usr/local/sbin/rhel_patch.sh
+#
+# (In some cron implementations, day-of-month AND day-of-week are OR'd when
+# both are restricted, which is why the date test is still included.)
+#===============================================================================
