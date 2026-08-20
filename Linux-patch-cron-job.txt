@@ -142,3 +142,5 @@ exit 0
 # (In some cron implementations, day-of-month AND day-of-week are OR'd when
 # both are restricted, which is why the date test is still included.)
 #===============================================================================
+
+cat > /etc/sudoers.d/ansible <<'EOF' Defaults:ansible !targetpw ansible ALL=(ALL) NOPASSWD: ALL EOF chmod 0440 /etc/sudoers.d/ansible visudo -cf /etc/sudoers.d/ansible
