@@ -1,0 +1,150 @@
+---
+# patch_suse_builtin.yml
+#
+# Patches SUSE (SLES / openSUSE) servers via raw zypper commands and
+# reboots them at the end if patching requires it.
+#
+# Uses ONLY ansible.builtin modules (command, shell, reboot, etc.) so it
+# runs on any AWX/Tower execution environment with no extra collections
+# installed.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini patch_suse_builtin.yml
+#   ansible-playbook -i inventory.ini patch_suse_builtin.yml -e "force_reboot=true"
+#   ansible-playbook -i inventory.ini patch_suse_builtin.yml -e "serial_batch=1"
+#   ansible-playbook -i inventory.ini patch_suse_builtin.yml --limit web01
+
+- name: Patch SUSE servers and reboot if needed
+  hosts: suse_servers
+  become: true
+  serial: "{{ serial_batch | default('30%') }}"
+  max_fail_percentage: 20
+
+  vars:
+    force_reboot: false
+    reboot_timeout_seconds: 600
+    patch_log_dir: /var/log/ansible-patching
+    exclude_patterns: []   # e.g. ["kernel-default"] to hold back specific packages
+
+  pre_tasks:
+    - name: Ensure patch log directory exists
+      ansible.builtin.file:
+        path: "{{ patch_log_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Record uptime before patching
+      ansible.builtin.command: uptime -s
+      register: uptime_before
+      changed_when: false
+
+    - name: Lock excluded packages so they are skipped by patch/update
+      ansible.builtin.command: "zypper --non-interactive addlock {{ item }}"
+      loop: "{{ exclude_patterns }}"
+      changed_when: true
+      when: exclude_patterns | length > 0
+
+  tasks:
+    - name: Refresh zypper repositories
+      ansible.builtin.command: zypper --non-interactive refresh
+      register: repo_refresh
+      changed_when: "'Repository' in repo_refresh.stdout and 'up to date' not in repo_refresh.stdout"
+      failed_when: repo_refresh.rc != 0
+
+    - name: List available patches (informational)
+      ansible.builtin.command: zypper --non-interactive list-patches
+      register: available_patches
+      changed_when: false
+      failed_when: available_patches.rc not in [0, 100, 101]
+      # rc 100/101 just mean "patches are available" when using list-patches
+
+    - name: Show available patches
+      ansible.builtin.debug:
+        msg: "{{ available_patches.stdout_lines }}"
+
+    - name: Apply all available patches
+      ansible.builtin.command: zypper --non-interactive patch --auto-agree-with-licenses
+      register: patch_result
+      changed_when: "'Nothing to do' not in patch_result.stdout"
+      failed_when: patch_result.rc not in [0, 102, 103]
+      # rc 0   = success, no reboot needed
+      # rc 102 = success, reboot required
+      # rc 103 = success, zypper itself was updated (safe to treat as success)
+
+    - name: Apply any remaining package updates
+      ansible.builtin.command: zypper --non-interactive update --auto-agree-with-licenses
+      register: package_update_result
+      changed_when: "'Nothing to do' not in package_update_result.stdout"
+      failed_when: package_update_result.rc not in [0, 102, 103]
+
+    - name: Check whether zypper thinks a reboot is required
+      ansible.builtin.command: zypper needs-rebooting
+      register: needs_reboot_check
+      changed_when: false
+      failed_when: false
+      # exit code 0 = no reboot needed, 102 = reboot needed
+      # (not present on very old zypper versions, hence failed_when: false)
+
+    - name: Check for processes still using deleted/updated files
+      ansible.builtin.command: zypper ps -s
+      register: reboot_check
+      changed_when: false
+      failed_when: false
+
+    - name: Determine reboot need
+      ansible.builtin.set_fact:
+        reboot_needed: >-
+          {{
+            force_reboot
+            or (patch_result.rc == 102)
+            or (package_update_result.rc == 102)
+            or (needs_reboot_check.rc == 102)
+            or ('reboot' in (reboot_check.stdout | default('')) | lower)
+          }}
+
+    - name: Write patch summary to log
+      ansible.builtin.copy:
+        dest: "{{ patch_log_dir }}/{{ ansible_date_time.date }}_{{ inventory_hostname }}.log"
+        content: |
+          Patch run: {{ ansible_date_time.iso8601 }}
+          Host: {{ inventory_hostname }}
+          Uptime before: {{ uptime_before.stdout }}
+          Patch task changed: {{ patch_result.changed }}
+          Update task changed: {{ package_update_result.changed }}
+          Reboot needed: {{ reboot_needed }}
+        mode: "0640"
+
+  post_tasks:
+    - name: Remove package locks set for this run
+      ansible.builtin.command: "zypper --non-interactive removelock {{ item }}"
+      loop: "{{ exclude_patterns }}"
+      changed_when: true
+      failed_when: false
+      when: exclude_patterns | length > 0
+
+    - name: Reboot the server
+      ansible.builtin.reboot:
+        msg: "Rebooting after patching via Ansible"
+        reboot_timeout: "{{ reboot_timeout_seconds }}"
+        pre_reboot_delay: 5
+        post_reboot_delay: 10
+        test_command: uptime
+      when: reboot_needed | bool
+
+    - name: Wait for server to be reachable again
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: "{{ reboot_timeout_seconds }}"
+      when: reboot_needed | bool
+
+    - name: Verify uptime after reboot
+      ansible.builtin.command: uptime -s
+      register: uptime_after
+      changed_when: false
+      when: reboot_needed | bool
+
+    - name: Report result for this host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: patching complete.
+          {{ 'Rebooted successfully.' if reboot_needed | bool else 'No reboot required.' }}
