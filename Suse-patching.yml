@@ -1,0 +1,131 @@
+---
+# patch_suse.yml
+#
+# Patches SUSE (SLES / openSUSE) servers via zypper and reboots them
+# at the end if patching requires it (or always, if force_reboot=true).
+#
+# Usage:
+#   ansible-playbook -i inventory.ini patch_suse.yml
+#   ansible-playbook -i inventory.ini patch_suse.yml -e "force_reboot=true"
+#   ansible-playbook -i inventory.ini patch_suse.yml -e "serial_batch=1"   # one host at a time
+#   ansible-playbook -i inventory.ini patch_suse.yml --limit web01        # single host
+#
+# Requires: community.general collection is NOT required; this uses only
+# ansible.builtin modules plus the community.general.zypper module which
+# ships with the "community.general" collection. Install it with:
+#   ansible-galaxy collection install community.general
+
+- name: Patch SUSE servers and reboot if needed
+  hosts: suse_servers
+  become: true
+  serial: "{{ serial_batch | default('30%') }}"   # roll through hosts in batches, not all at once
+  max_fail_percentage: 20                          # stop the run if too many hosts fail
+
+  vars:
+    force_reboot: false          # set true to always reboot, even if zypper says it's not needed
+    reboot_timeout_seconds: 600  # how long to wait for the host to come back
+    patch_log_dir: /var/log/ansible-patching
+    exclude_patterns: []         # e.g. ["kernel-*"] to hold back kernel updates
+
+  pre_tasks:
+    - name: Ensure patch log directory exists
+      ansible.builtin.file:
+        path: "{{ patch_log_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Record uptime before patching
+      ansible.builtin.command: uptime -s
+      register: uptime_before
+      changed_when: false
+
+  tasks:
+    - name: Refresh zypper repositories
+      community.general.zypper_repository:
+        repo: "*"
+        runrefresh: true
+      register: repo_refresh
+
+    - name: List available patches (informational)
+      ansible.builtin.command: zypper --non-interactive list-patches
+      register: available_patches
+      changed_when: false
+      failed_when: false  # exit code 100/101 from zypper just means "updates available"
+
+    - name: Show available patches
+      ansible.builtin.debug:
+        msg: "{{ available_patches.stdout_lines }}"
+
+    - name: Apply all available patches
+      community.general.zypper:
+        name: "*"
+        state: latest
+        type: patch
+        extra_args: >-
+          {{ exclude_patterns | map('regex_replace', '^(.*)$', '-x \\1') | join(' ') }}
+      register: patch_result
+
+    - name: Apply any remaining package updates (non-patch updates)
+      community.general.zypper:
+        name: "*"
+        state: latest
+        update_cache: true
+      register: package_update_result
+
+    - name: Check whether a reboot is required
+      ansible.builtin.command: zypper ps -s
+      register: reboot_check
+      changed_when: false
+      failed_when: false
+      # zypper ps -s prints "Reboot is suggested" (or similar) when the kernel,
+      # glibc, or other core libs changed and processes are using deleted files.
+
+    - name: Determine reboot need
+      ansible.builtin.set_fact:
+        reboot_needed: >-
+          {{
+            force_reboot
+            or (patch_result.changed | default(false))
+            or (package_update_result.changed | default(false))
+            or ('reboot' in (reboot_check.stdout | default('')) | lower)
+          }}
+
+    - name: Write patch summary to log
+      ansible.builtin.copy:
+        dest: "{{ patch_log_dir }}/{{ ansible_date_time.date }}_{{ inventory_hostname }}.log"
+        content: |
+          Patch run: {{ ansible_date_time.iso8601 }}
+          Host: {{ inventory_hostname }}
+          Uptime before: {{ uptime_before.stdout }}
+          Patches applied (changed): {{ patch_result.changed }}
+          Packages updated (changed): {{ package_update_result.changed }}
+          Reboot needed: {{ reboot_needed }}
+        mode: "0640"
+
+  post_tasks:
+    - name: Reboot the server
+      ansible.builtin.reboot:
+        msg: "Rebooting after patching via Ansible"
+        reboot_timeout: "{{ reboot_timeout_seconds }}"
+        pre_reboot_delay: 5
+        post_reboot_delay: 10
+        test_command: uptime
+      when: reboot_needed | bool
+
+    - name: Wait for server to be reachable again
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: "{{ reboot_timeout_seconds }}"
+      when: reboot_needed | bool
+
+    - name: Verify uptime after reboot (confirms the box actually restarted)
+      ansible.builtin.command: uptime -s
+      register: uptime_after
+      changed_when: false
+      when: reboot_needed | bool
+
+    - name: Report result for this host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: patching complete.
+          {{ 'Rebooted successfully.' if reboot_needed | bool else 'No reboot required.' }}
