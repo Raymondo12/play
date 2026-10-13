@@ -1,0 +1,118 @@
+---
+# google_component_versions.yml
+# Reports installed versions of Google components on RHEL / Ubuntu / SUSE hosts.
+#
+# Usage:
+#   ansible-playbook -i inventory google_component_versions.yml
+#   ansible-playbook -i inventory google_component_versions.yml -e report_path=/tmp/google_versions.csv
+#   ansible-playbook -i inventory google_component_versions.yml -e '{"google_pkg_regex": "^(google-chrome|google-cloud-cli)"}'
+#
+# Method:
+#   1. package_facts queries rpm (RHEL, SUSE) or dpkg (Ubuntu) and filters Google packages.
+#   2. Binary probes catch installs made outside the package manager (tarball gcloud, etc.).
+#   3. Results print per host and are merged into one CSV on the controller.
+
+- name: Retrieve installed Google component versions
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    report_path: "./google_component_versions.csv"
+    # Package names treated as "Google components". Extend as needed.
+    google_pkg_regex: "^(google-|gcloud|google_|kubectl$)"
+    # Binary probes: name, binary to look for, command that prints its version
+    binary_probes:
+      - { name: google-chrome, bin: google-chrome, cmd: "google-chrome --version" }
+      - { name: google-chrome-stable, bin: google-chrome-stable, cmd: "google-chrome-stable --version" }
+      - { name: gcloud, bin: gcloud, cmd: "gcloud --version | head -n1" }
+      - { name: google_osconfig_agent, bin: google_osconfig_agent, cmd: "google_osconfig_agent --version 2>&1 | head -n1" }
+      - { name: google_guest_agent, bin: google_guest_agent, cmd: "google_guest_agent --version 2>&1 | head -n1" }
+      - { name: google_cloud_ops_agent, bin: google_cloud_ops_agent_engine, cmd: "google_cloud_ops_agent_engine -version 2>&1 | head -n1" }
+    extra_path: "/usr/bin:/usr/local/bin:/opt/google/chrome:/usr/lib/google-cloud-sdk/bin:/opt/google-cloud-sdk/bin:/opt/google-cloud-ops-agent/subagents/bin"
+
+  tasks:
+    - name: Confirm supported OS family
+      ansible.builtin.assert:
+        that: ansible_os_family in ['RedHat', 'Debian', 'Suse']
+        fail_msg: "Unsupported OS family {{ ansible_os_family }} on {{ inventory_hostname }}"
+        quiet: true
+
+    - name: Gather package facts (rpm or dpkg, auto-detected)
+      ansible.builtin.package_facts:
+        manager: auto
+      # Ubuntu hosts need python3-apt; RHEL/SUSE need the rpm python bindings.
+
+    - name: Filter Google packages
+      ansible.builtin.set_fact:
+        google_pkgs: >-
+          {{ ansible_facts.packages | dict2items
+             | selectattr('key', 'match', google_pkg_regex) | list }}
+
+    - name: Build package rows
+      ansible.builtin.set_fact:
+        google_rows: >-
+          {{ (google_rows | default([])) + [{
+               'component': item.key,
+               'version': (item.value | map(attribute='version') | list | first)
+                          ~ ('-' ~ (item.value | map(attribute='release', default='') | list | first)
+                             if (item.value | map(attribute='release', default='') | list | first) else ''),
+               'source': 'package'
+             }] }}
+      loop: "{{ google_pkgs }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Probe binaries (catches non-package installs)
+      ansible.builtin.shell: "command -v {{ item.bin }} >/dev/null 2>&1 && {{ item.cmd }}"
+      args:
+        executable: /bin/bash
+      environment:
+        PATH: "{{ extra_path }}:{{ ansible_env.PATH | default('/usr/sbin:/sbin') }}"
+      register: bin_probe
+      changed_when: false
+      failed_when: false
+      loop: "{{ binary_probes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Add binary rows
+      ansible.builtin.set_fact:
+        google_rows: >-
+          {{ (google_rows | default([])) + [{
+               'component': item.item.name,
+               'version': (item.stdout_lines | first | trim),
+               'source': 'binary'
+             }] }}
+      loop: "{{ bin_probe.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when:
+        - item.rc == 0
+        - item.stdout_lines | length > 0
+
+    - name: Ensure rows list exists
+      ansible.builtin.set_fact:
+        google_rows: "{{ google_rows | default([]) }}"
+
+    - name: Show results for this host
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_distribution }} {{ ansible_distribution_version }}:
+          {% if google_rows | length == 0 %}no Google components found
+          {% else %}{% for r in google_rows %}{{ r.component }}={{ r.version }} ({{ r.source }}){{ '; ' if not loop.last }}{% endfor %}{% endif %}
+
+    - name: Write consolidated CSV on the controller
+      run_once: true
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        dest: "{{ report_path }}"
+        mode: "0644"
+        content: |
+          host,os,component,version,source
+          {% for h in ansible_play_hosts %}
+          {% for r in hostvars[h].google_rows %}
+          {{ h }},{{ hostvars[h].ansible_distribution }} {{ hostvars[h].ansible_distribution_version }},{{ r.component }},"{{ r.version }}",{{ r.source }}
+          {% endfor %}
+          {% endfor %}
