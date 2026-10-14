@@ -1,0 +1,136 @@
+#!/bin/bash
+#===============================================================================
+# rhel_patch.sh
+# Patches RHEL 7/8/9 hosts during the 1st and 3rd week of each month
+# (1st and 3rd Wednesday), then reboots if required.
+#
+# Deploy to: /usr/local/sbin/rhel_patch.sh   (chmod 750, owner root)
+#
+# Cron (root crontab) - fires every Wednesday 02:00, script decides whether to run:
+#   0 2 * * 3 /usr/local/sbin/rhel_patch.sh
+#
+# Optional environment variables:
+#   FORCE_REBOOT=yes    always reboot after patching
+#   FORCE_RUN=yes       skip the 1st/3rd Friday check (manual/test runs)
+#===============================================================================
+
+set -o pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+LOGFILE="/var/log/rhel_patch.log"
+LOCKFILE="/var/run/rhel_patch.lock"
+FORCE_REBOOT="${FORCE_REBOOT:-no}"
+FORCE_RUN="${FORCE_RUN:-no}"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] $*" | tee -a "$LOGFILE"
+}
+
+[[ $EUID -eq 0 ]] || { echo "Must be run as root." >&2; exit 1; }
+
+#-------------------------------------------------------------------------------
+# Date guard: Wednesday AND day-of-month 1-7 (1st Wed) or 15-21 (3rd Wed)
+#-------------------------------------------------------------------------------
+DOM=$(date +%-d)
+DOW=$(date +%u)   # 3 = Wednesday
+
+if [[ "$FORCE_RUN" != "yes" ]]; then
+    if [[ "$DOW" -ne 3 ]]; then
+        log "Not a Wednesday (dow=$DOW). Exiting."
+        exit 0
+    fi
+    if ! { (( DOM >= 1 && DOM <= 7 )) || (( DOM >= 15 && DOM <= 21 )); }; then
+        log "Wednesday, but not the 1st or 3rd Wednesday (dom=$DOM). Exiting."
+        exit 0
+    fi
+fi
+
+#-------------------------------------------------------------------------------
+# Prevent overlapping runs
+#-------------------------------------------------------------------------------
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    log "Another patch run is already in progress. Exiting."
+    exit 1
+fi
+
+log "===== Patch run starting on $(hostname -f) ====="
+log "OS: $(cat /etc/redhat-release 2>/dev/null || echo unknown)"
+log "Kernel before: $(uname -r)"
+
+#-------------------------------------------------------------------------------
+# Package manager: dnf (RHEL 8/9) or yum (RHEL 7)
+#-------------------------------------------------------------------------------
+if command -v dnf &>/dev/null; then PKG_MGR="dnf"; else PKG_MGR="yum"; fi
+log "Package manager: $PKG_MGR  (updating ALL packages: OS, kernel, third-party repos)"
+
+# --nobest (dnf only) lets dnf install the newest installable version instead of
+# aborting the whole transaction when the very latest build has unmet dependencies.
+UPDATE_OPTS="-y"
+[[ "$PKG_MGR" == "dnf" ]] && UPDATE_OPTS="-y --nobest"
+
+#-------------------------------------------------------------------------------
+# Check and apply updates
+#-------------------------------------------------------------------------------
+$PKG_MGR clean all >>"$LOGFILE" 2>&1
+
+log "Checking for updates..."
+$PKG_MGR check-update >>"$LOGFILE" 2>&1
+RC=$?
+
+if [[ $RC -eq 0 ]]; then
+    log "No updates available. ===== Run complete (no changes) ====="
+    exit 0
+elif [[ $RC -ne 100 ]]; then
+    log "ERROR: check-update failed (rc=$RC). Check repos/subscription-manager."
+    exit 1
+fi
+
+log "Applying updates..."
+$PKG_MGR $UPDATE_OPTS update >>"$LOGFILE" 2>&1
+RC=$?
+if [[ $RC -ne 0 ]]; then
+    log "ERROR: update failed (rc=$RC). NOT rebooting. Investigate manually."
+    exit 1
+fi
+log "Patching completed successfully."
+
+# Verify: anything still pending (held back by excludes/versionlock/dependencies)?
+log "Verifying nothing is left to update..."
+$PKG_MGR check-update >>"$LOGFILE" 2>&1
+if [[ $? -eq 100 ]]; then
+    log "WARNING: some updates are still pending (excluded, version-locked or dependency-blocked). See list above in $LOGFILE."
+else
+    log "All available updates are installed."
+fi
+
+#-------------------------------------------------------------------------------
+# Reboot decision
+#-------------------------------------------------------------------------------
+REBOOT_NEEDED="no"
+
+if [[ "$FORCE_REBOOT" == "yes" ]]; then
+    REBOOT_NEEDED="yes"
+    log "FORCE_REBOOT=yes - rebooting regardless of needs-restarting."
+elif command -v needs-restarting &>/dev/null; then
+    needs-restarting -r >>"$LOGFILE" 2>&1
+    if [[ $? -eq 1 ]]; then
+        REBOOT_NEEDED="yes"
+        log "needs-restarting: reboot required."
+    else
+        log "needs-restarting: no reboot required."
+    fi
+else
+    REBOOT_NEEDED="yes"
+    log "needs-restarting not found (install yum-utils / dnf-utils). Defaulting to reboot."
+fi
+
+if [[ "$REBOOT_NEEDED" == "yes" ]]; then
+    log "Rebooting in 2 minutes. Cancel with: shutdown -c"
+    log "===== Run complete (reboot scheduled) ====="
+    /usr/sbin/shutdown -r +2 "Post-patching reboot (rhel_patch.sh)" >>"$LOGFILE" 2>&1
+else
+    log "===== Run complete (no reboot needed) ====="
+fi
+
+exit 0
