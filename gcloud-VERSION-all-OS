@@ -1,0 +1,52 @@
+---
+# Report installed and available versions of Google packages
+# (google-cloud-sdk, google-osconfig-agent, google-guest-agent, google-compute-engine, ...)
+# Works on RHEL (RedHat), SUSE/SLES (Suse) and Ubuntu/Debian (Debian).
+#
+# Usage: ansible-playbook -i inventory google_packages_versions.yml
+
+- name: Show Google package versions
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Package names to look for (regex). Adjust if needed.
+    google_pkg_regex: '^(google|gce)'
+
+  tasks:
+    - name: Gather installed package facts
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Build list of installed Google packages
+      ansible.builtin.set_fact:
+        google_pkgs: "{{ ansible_facts.packages | dict2items | selectattr('key', 'match', google_pkg_regex) | list }}"
+
+    - name: Query available (candidate / update) version per package
+      ansible.builtin.shell: "{{ avail_cmd[ansible_os_family] }}"
+      vars:
+        avail_cmd:
+          Debian: "apt-cache policy {{ item.key }} | awk '/Candidate:/{print $2}'"
+          RedHat: "yum -q list updates {{ item.key }} 2>/dev/null | awk 'NR>1{print $2}'; true"
+          Suse: "zypper --quiet --non-interactive list-updates | awk -F'|' -v p='{{ item.key }}' '{n=$3; gsub(/ /,\"\",n); if (n==p) {v=$5; gsub(/ /,\"\",v); print v}}'; true"
+      loop: "{{ google_pkgs }}"
+      loop_control:
+        label: "{{ item.key }}"
+      register: avail
+      changed_when: false
+
+    - name: Display Google package versions
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} | {{ item.item.key }} |
+          installed: {{ item.item.value | map(attribute='version') | join(', ') }} |
+          available: {{ (item.stdout | trim) if (item.stdout | trim) else 'up to date / none newer' }}
+      loop: "{{ avail.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: No Google packages found
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: no packages matching '{{ google_pkg_regex }}' installed"
+      when: google_pkgs | length == 0
