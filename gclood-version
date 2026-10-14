@@ -1,29 +1,71 @@
 ---
-- name: List Google Cloud SDK components
+# Report installed and available versions of Google components/packages.
+# Usage: ansible-playbook -i inventory google_packages_versions.yml
+- name: Google packages - installed vs available versions
   hosts: all
-  gather_facts: false
+  become: true
+  gather_facts: true
+
+  vars:
+    google_packages:
+      - google-guest-agent
+      - google-osconfig-agent
+      - google-cloud-cli
+      - google-cloud-sdk
+      - google-cloud-ops-agent
+      - google-compute-engine
+      - google-compute-engine-oslogin
+      - google-compute-engine-guest-configs
 
   tasks:
-    - name: Get installed components
-      ansible.builtin.command: >
-        gcloud components list
-        --filter="state.name=Installed"
-        --format="table(id,version.installed_version:label=VERSION)"
-      register: installed_components
+    - name: Gather installed package facts
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Refresh package metadata (Debian family)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Get available version (Debian family)
+      ansible.builtin.shell: >
+        apt-cache policy {{ item }} | awk '/Candidate:/ {print $2}'
+      register: apt_available
       changed_when: false
+      failed_when: false
+      loop: "{{ google_packages }}"
+      when: ansible_os_family == "Debian"
 
-    - name: Get available (not installed) components
-      ansible.builtin.command: >
-        gcloud components list
-        --filter="state.name='Not Installed'"
-        --format="table(id,version.latest_version_string:label=LATEST_VERSION)"
-      register: available_components
+    - name: Get available version (RedHat family)
+      ansible.builtin.shell: >
+        dnf -q repoquery --latest-limit 1 --qf '%{version}-%{release}' {{ item }} 2>/dev/null | tail -n1
+      register: rpm_available
       changed_when: false
+      failed_when: false
+      loop: "{{ google_packages }}"
+      when: ansible_os_family == "RedHat"
 
-    - name: Show installed components
-      ansible.builtin.debug:
-        var: installed_components.stdout_lines
+    - name: Build version report
+      ansible.builtin.set_fact:
+        google_report: >-
+          {{ google_report | default([]) + [ {
+            'package': item,
+            'installed': (ansible_facts.packages[item][0].version
+                          if item in ansible_facts.packages else 'not installed'),
+            'available': (
+              (apt_available.results | selectattr('item', 'equalto', item)
+                | map(attribute='stdout') | first | default('n/a'))
+              if ansible_os_family == 'Debian' else
+              (rpm_available.results | selectattr('item', 'equalto', item)
+                | map(attribute='stdout') | first | default('n/a'))
+            ) | trim | default('n/a', true)
+          } ] }}
+      loop: "{{ google_packages }}"
 
-    - name: Show available components
+    - name: Show Google package versions
       ansible.builtin.debug:
-        var: available_components.stdout_lines
+        msg: "{{ item.package }}: installed={{ item.installed }} | available={{ item.available }}"
+      loop: "{{ google_report }}"
+      loop_control:
+        label: "{{ item.package }}"
