@@ -1,0 +1,29 @@
+---
+- name: List Google Cloud SDK components
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Get installed components
+      ansible.builtin.command: >
+        gcloud components list
+        --filter="state.name=Installed"
+        --format="table(id,version.installed_version:label=VERSION)"
+      register: installed_components
+      changed_when: false
+
+    - name: Get available (not installed) components
+      ansible.builtin.command: >
+        gcloud components list
+        --filter="state.name='Not Installed'"
+        --format="table(id,version.latest_version_string:label=LATEST_VERSION)"
+      register: available_components
+      changed_when: false
+
+    - name: Show installed components
+      ansible.builtin.debug:
+        var: installed_components.stdout_lines
+
+    - name: Show available components
+      ansible.builtin.debug:
+        var: available_components.stdout_lines
