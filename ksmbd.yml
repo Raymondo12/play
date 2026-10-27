@@ -1,0 +1,81 @@
+---
+# Check whether ksmbd (the in-kernel SMB server) is enabled/running on hosts.
+# Usage: ansible-playbook -i inventory check_ksmbd.yml
+- name: Check ksmbd status on hosts
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Check kernel build config for ksmbd (CONFIG_SMB_SERVER)
+      ansible.builtin.shell: |
+        if [ -f /boot/config-{{ ansible_kernel }} ]; then
+          grep -E '^CONFIG_SMB_SERVER=' /boot/config-{{ ansible_kernel }} || echo "CONFIG_SMB_SERVER not set"
+        elif [ -f /proc/config.gz ]; then
+          zgrep -E '^CONFIG_SMB_SERVER=' /proc/config.gz || echo "CONFIG_SMB_SERVER not set"
+        else
+          echo "kernel config not found"
+        fi
+      register: ksmbd_kconfig
+      changed_when: false
+      failed_when: false
+
+    - name: Check if ksmbd module is available on disk
+      ansible.builtin.command: modinfo -n ksmbd
+      register: ksmbd_modinfo
+      changed_when: false
+      failed_when: false
+
+    - name: Check if ksmbd module is currently loaded
+      ansible.builtin.stat:
+        path: /sys/module/ksmbd
+      register: ksmbd_loaded
+
+    - name: Check if ksmbd service is enabled
+      ansible.builtin.command: systemctl is-enabled ksmbd
+      register: ksmbd_enabled
+      changed_when: false
+      failed_when: false
+
+    - name: Check if ksmbd service is active
+      ansible.builtin.command: systemctl is-active ksmbd
+      register: ksmbd_active
+      changed_when: false
+      failed_when: false
+
+    - name: Check if ksmbd is configured to load at boot
+      ansible.builtin.shell: >
+        grep -rlsE '^\s*ksmbd' /etc/modules /etc/modules-load.d/ 2>/dev/null || echo "none"
+      register: ksmbd_boot_load
+      changed_when: false
+      failed_when: false
+
+    - name: Check if anything is listening on SMB port 445
+      ansible.builtin.shell: ss -Hltn 'sport = :445' | wc -l
+      register: smb_port
+      changed_when: false
+      failed_when: false
+
+    - name: Display ksmbd status
+      ansible.builtin.debug:
+        msg:
+          - "Host:                 {{ inventory_hostname }}"
+          - "Kernel:               {{ ansible_kernel }}"
+          - "Kernel config:        {{ ksmbd_kconfig.stdout | default('unknown') }}"
+          - "Module available:     {{ 'yes (' ~ ksmbd_modinfo.stdout ~ ')' if ksmbd_modinfo.rc == 0 else 'no' }}"
+          - "Module loaded:        {{ 'YES' if ksmbd_loaded.stat.exists else 'no' }}"
+          - "Service enabled:      {{ ksmbd_enabled.stdout | default('n/a', true) }}"
+          - "Service active:       {{ ksmbd_active.stdout | default('n/a', true) }}"
+          - "Load at boot config:  {{ ksmbd_boot_load.stdout }}"
+          - "Port 445 listening:   {{ 'yes' if (smb_port.stdout | int) > 0 else 'no' }}"
+          - "VERDICT:              {{ 'KSMBD ENABLED' if (ksmbd_loaded.stat.exists or ksmbd_active.stdout == 'active' or ksmbd_enabled.stdout == 'enabled') else 'ksmbd not enabled' }}"
+
+    - name: Summary of hosts with ksmbd enabled
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_play_hosts
+             | map('extract', hostvars)
+             | selectattr('ksmbd_loaded.stat.exists')
+             | map(attribute='inventory_hostname') | list
+             | default([], true) }}
+      run_once: true
