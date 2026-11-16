@@ -1,0 +1,63 @@
+Major issues encountered while patching
+Space Issue:
+
+-	/usr due to Linux-firmware installation in that specific filesystem
+-	/boot 
+-	/var 
+
+Connectivity issue
+Ansible user unable to connect to hosts:
+-	Wrong firewald group
+-	Missing routing to ansible host
+
+Misconfiguration in ssh config file for ansible user (SUSE Prod host)
+
+-	Incorrect/root password (fixed after couple session of troubleshooting with Nadi)
+
+
+
+# Linux Filesystem Space Issues Impacting Monthly Patching
+
+We are currently having filesystem space issues across several of our Linux servers. This is causing our Ansible patching jobs to fail, thus not completing our monthly patching activities.
+1-	Filesystem Space Issues
+The primary issues are with the /usr, /boot and /var filesystems.
+1.1-	 /usr  (Linux Firmware Installation)
+The package installation/upgrade fails because of insufficient disk space in the /usr filesystem. This is particularly the case with the linux-firmware package, which is a very large package.
+
+**Ansible Job Failure:**
+*[Insert screenshot of Ansible patching failure related to /usr]*
+
+1.2-	 /boot – (Kernel Updates)
+There is not enough space on the /boot filesystem to install new kernel packages and create the corresponding initramfs images during patching. Usually there are too many old kernels on a server.
+
+**Ansible Job Failure:**
+*[Insert screenshot of Ansible patching failure related to /boot]*
+
+1.3-	 /var – Package Cache and Logs
+This can be caused by growing system logs, package caches, and temporary files in /var. DNF/YUM will not be able to complete package updates.
+
+**Ansible Job Failure:**
+*[Insert screenshot of Ansible patching failure related to /var]*
+
+2. Connectivity Issues – Ansible Hosts Unreachable
+Network connectivity and authentication issues are another major cause of Ansible patching failures. These occur when the Ansible controller cannot establish an SSH connection to the target Linux servers.
+Potential causes include:
+•	Incorrect firewall group or zone: Servers assigned to the wrong firewall security group, zone, or policy may block SSH connections from the Ansible controller.
+•	Missing network routing: Missing or incorrect routes between the Ansible controller and target hosts can result in errors such as No route to host or Network is unreachable.
+•	Firewall rules blocking SSH: Network firewalls, host-based firewalld, or iptables/nftables rules may prevent inbound SSH traffic on port 22.
+•	SSH service issues: The sshd service may be stopped, failing, or listening on an unexpected port.
+•	Incorrect IP address or DNS resolution: Outdated inventory records, incorrect IP addresses, or DNS resolution failures can cause Ansible to connect to the wrong destination or fail to locate the host.
+•	Ansible account authentication issues: Incorrect SSH keys, expired or locked accounts, missing authorized keys, or AD/LDAP authentication problems may prevent the Ansible service account from logging in.
+•	SSH access restrictions: Configuration settings such as AllowUsers, AllowGroups, or PAM access controls may deny access to the Ansible account.
+•	Host unavailable: Servers that are powered off, undergoing maintenance, experiencing network interface issues, or otherwise unreachable will cause Ansible connection failures.
+•	Incorrect Ansible inventory configuration: Invalid hostnames, incorrect ansible_host values, wrong SSH ports, or incorrect connection variables can prevent successful connections.
+Common Ansible error messages:
+UNREACHABLE! => Failed to connect to the host via ssh
+
+ssh: connect to host x.x.x.x port 22: No route to host
+
+ssh: connect to host x.x.x.x port 22: Connection timed out
+
+ssh: connect to host x.x.x.x port 22: Connection refused
+
+Permission denied (publickey,password)
