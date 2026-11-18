@@ -1,0 +1,16 @@
+## Linux Patching Status – 93% Completion
+
+Approximately **93% of Linux hosts have been successfully patched**. We are making good progress toward our goal of 100% patching compliance, but a few outstanding issues are preventing us from reaching that target.
+
+The main blockers are:
+
+1. **Insufficient Disk Space:** Some servers do not have enough available space on critical filesystems, including `/usr`, `/var`, and `/boot`, causing patching jobs to fail.
+
+2. **GCP Host Accessibility Issues:** Ansible is unable to connect to certain GCP hosts. These connectivity failures may be caused by incorrect firewall rules, missing network routes, DNS resolution issues, or other access-related configuration problems.
+
+**For additional details, I have included two links in this presentation:**
+
+- **Disk Space Issues:** A link to the tickets opened to track and resolve filesystem space issues.
+- **Ansible Connectivity Failures:** A link documenting the different error messages encountered by Ansible when attempting to connect to affected hosts, along with potential causes.
+
+We will continue working through these blockers to improve patching coverage and achieve our **100% completion goal**.
